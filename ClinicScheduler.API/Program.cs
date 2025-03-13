@@ -9,17 +9,14 @@ builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowFrontend", policy =>
     {
-        policy.WithOrigins(
-                "http://localhost:3000",
-                "http://frontend:3000" // Docker service name
-             )
-             .AllowAnyMethod()
-             .AllowAnyHeader()
-             .AllowCredentials();
+        policy.WithOrigins(builder.Configuration.GetSection("CORS:AllowedOrigins").Get<string[]>() ?? 
+                          new[] { "http://localhost:3000", $"http://{Environment.GetEnvironmentVariable("FRONTEND_IP")}" })
+              .AllowAnyMethod()
+              .AllowAnyHeader()
+              .AllowCredentials();
     });
 });
 
-builder.WebHost.UseUrls("http://0.0.0.0:5289");
 builder.Services.AddSwaggerGen(c =>
 {
     c.SwaggerDoc("v1", new Microsoft.OpenApi.Models.OpenApiInfo

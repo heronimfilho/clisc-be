@@ -3,41 +3,107 @@ name: Deploy Backend to AWS
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - 'clinic-scheduler-frontend/**'
 
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout Code
+        uses: actions/checkout@v3
       
-      - name: Configure AWS credentials
+      # Add caching for Docker layers
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v1
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
-      
+
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
       
-      - name: Build and push backend image
+      # Add versioning with git sha and date
+      - name: Set image tag
+        id: vars
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "date=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+      
+      - name: Build and Push Backend Image
         uses: docker/build-push-action@v3
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/clinic-backend:latest
-      
+          # Use buildx cache
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/clinic-backend:latest
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/clinic-backend:${{ steps.vars.outputs.date }}-${{ steps.vars.outputs.sha_short }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
       - name: Deploy to EC2
         uses: appleboy/ssh-action@master
         with:
-          host: ${{ secrets.EC2_HOST }}
+          host: ${{ secrets.BACKEND_EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             cd /app
-            export AWS_ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
-            export AWS_REGION=us-east-1
-            export RDS_ENDPOINT=${{ secrets.RDS_ENDPOINT }}
-            sudo ./update-backend.sh
+            
+            # Set environment variables in a .env file instead of exporting them
+            cat > .env << EOF
+            AWS_ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
+            AWS_REGION=us-east-1
+            RDS_HOSTNAME=${{ secrets.RDS_HOSTNAME }}
+            RDS_DB_NAME=${{ secrets.RDS_DB_NAME }}
+            RDS_USERNAME=${{ secrets.RDS_USERNAME }}
+            RDS_PASSWORD=${{ secrets.RDS_PASSWORD }}
+            FRONTEND_IP=${{ secrets.FRONTEND_EC2_HOST }}
+            EOF
+            
+            # Log in to ECR
+            aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+            
+            # Pull the latest image
+            docker-compose pull
+            
+            # Add health check before stopping current service
+            CURRENT_CONTAINER=$(docker ps -q --filter "name=backend")
+            if [ ! -z "$CURRENT_CONTAINER" ]; then
+              echo "Backing up current container status..."
+            fi
+            
+            # Restart service
+            docker-compose down
+            docker-compose up -d
+            
+            # Verify deployment was successful
+            sleep 10
+            if [ "$(docker ps -q --filter "name=backend")" ]; then
+              echo "✅ Deployment successful"
+            else
+              echo "❌ Deployment failed"
+              exit 1
+            fi
+            
+            # Clean up old images to save space
+            docker image prune -f --filter "until=24h"
+      
+      - name: Notify on Success
+        if: success()
+        run: echo "Backend deployment completed successfully!"
+      
+      - name: Notify on Failure
+        if: failure()
+        run: echo "Backend deployment failed!"
